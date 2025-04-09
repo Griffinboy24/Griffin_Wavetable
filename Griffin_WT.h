@@ -45,6 +45,7 @@
 #include <cassert>
 #include <climits>
 #include <cstdlib>
+#include <cmath> // required for sin()
 
 namespace project
 {
@@ -58,7 +59,9 @@ namespace project
     using namespace scriptnode;
 
     //===============================================================
-    // Real-time saw example with EXACT test_saw() wrap logic
+    // Real-time saw example with EXACT test_saw() wrap logic, using two
+    // padded waveforms: a saw (first half) and then a sine (second half). 
+    // We only use the saw in playback.
     //===============================================================
     template <int NV>
     struct Griffin_WT : public data::base
@@ -83,17 +86,18 @@ namespace project
         //===============================================================
         // Resampler fields
         //===============================================================
-        std::vector<float> sawSignal;
+        std::vector<float> sawSignal;  // Now holds both waveforms consecutively.
         rspl::MipMapFlt    mipMap;
         rspl::InterpPack   interpPack;
         rspl::ResamplerFlt resampler;
 
         // We replicate test_saw from the original main.cpp:
         //   wavelength must be a power of two,
-        //   block_len = 57 (arbitrary),
-        //   we build saw_len = wavelength * block_len * 4
-        const long wavelength = 1L << 10; // 1024
-        long sawLen = 0;
+        //   block_len = 256 (arbitrary),
+        //   we build two sections by copying a cycle repeatedly.
+        // Single-cycle length for each waveform is now 2048 samples.
+        const long wavelength = 1L << 11; // 2048
+        long tableSectionLen = 0;         // length of one waveform section (saw or sine)
 
         // Our user parameters
         float currentPitchParameter = 0.0f; // in octaves
@@ -102,39 +106,62 @@ namespace project
         Griffin_WT() {}
 
         //===============================================================
-        // Prepare: replicate the "test_saw" approach
+        // Prepare: replicate the test_saw approach but create two padded sections.
+        // First half is a saw (with headroom) and second half is sine.
         //===============================================================
         void prepare(PrepareSpecs specs)
         {
-            const long blockLen = 256;
-            sawLen = wavelength * blockLen; // same as test_saw
+            const long blockLen = 256;  // number of cycles per waveform section
+            tableSectionLen = wavelength * blockLen; // length for one waveform type
+            const long totalTableLen = tableSectionLen * 2;  // two sections: saw then sine
 
-            // Build the saw wave (just like generate_steady_saw)
-            sawSignal.resize(sawLen);
+            // Resize wavetable to hold both waveforms
+            sawSignal.resize(totalTableLen);
+
+            // Generate saw waveform (first half) with headroom (e.g. 80% of full amplitude)
+            const float headroom = 0.8f;
             {
-                double val = -1.0;
-                const double step = 2.0 / (static_cast<double>(wavelength) - 1.0);
-                for (long i = 0; i < sawLen; ++i)
+                double saw_val;
+                const double saw_step = 2.0 / (static_cast<double>(wavelength) - 1.0);
+                // Repeat single-cycle saw wave for blockLen cycles.
+                for (long cycle = 0; cycle < blockLen; ++cycle)
                 {
-                    if ((i % wavelength) == 0)
-                        val = -1.0;
-                    sawSignal[i] = static_cast<float>(val);
-                    val += step;
+                    saw_val = -1.0;
+                    for (long sample = 0; sample < wavelength; ++sample)
+                    {
+                        const long idx = cycle * wavelength + sample;
+                        sawSignal[idx] = static_cast<float>(headroom * saw_val);
+                        saw_val += saw_step;
+                    }
                 }
             }
 
-            // MipMap: 12 levels -> up to 10 octaves
+            // Generate sine waveform (second half) padded identically.
+            {
+                for (long cycle = 0; cycle < blockLen; ++cycle)
+                {
+                    for (long sample = 0; sample < wavelength; ++sample)
+                    {
+                        const long idx = tableSectionLen + cycle * wavelength + sample;
+                        const double phase = (2.0 * M_PI * sample) / wavelength;
+                        sawSignal[idx] = static_cast<float>(std::sin(phase));
+                    }
+                }
+            }
+
+            // MipMap: 12 levels -> up to 10 octaves.
+            // Note: totalTableLen is used now.
             mipMap.init_sample(
-                sawLen,
+                totalTableLen,
                 rspl::InterpPack::get_len_pre(),
                 rspl::InterpPack::get_len_post(),
                 12, // same as test_saw
                 rspl::ResamplerFlt::_fir_mip_map_coef_arr,
                 rspl::ResamplerFlt::MIP_MAP_FIR_LEN
             );
-            mipMap.fill_sample(sawSignal.data(), sawLen);
+            mipMap.fill_sample(sawSignal.data(), totalTableLen);
 
-            // Hook up resampler
+            // Hook up resampler.
             resampler.set_sample(mipMap);
             resampler.set_interp(interpPack);
             resampler.clear_buffers();
@@ -146,7 +173,9 @@ namespace project
         }
 
         //===============================================================
-        // Process: EXACT looping logic from test_saw
+        // Process: EXACT looping logic from test_saw.
+        // We force looping within the first section (saw) only.
+        // Debug prints via VS debug console are coded (commented out).
         //===============================================================
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
@@ -157,30 +186,32 @@ namespace project
             float* rightChannelData = audioBlock.getChannelPointer(1);
             const int numSamples = data.getNumSamples();
 
-            // Convert pitch: we are going from -2..+10, or whatever you do
+            // Convert pitch: we are going from -2..+10, or whatever you do.
             const long fixedPitch = rspl::round_long(
                 currentPitchParameter * (1 << rspl::ResamplerFlt::NBR_BITS_PER_OCT)
             );
             resampler.set_pitch(fixedPitch);
 
-            // We replicate test_saw EXACTLY:
-            //   if pos > (saw_len >> 1), do the bitmask and skip 16 periods
+            // EXACT test_saw loop-check:
+            // We use only the saw section (first half), so if pos > (tableSectionLen >> 1),
+            // do the bitmask and skip 16 periods.
             rspl::Int64 pos = resampler.get_playback_pos();
-            if ((pos >> 32) > (sawLen >> 1))
+            if ((pos >> 32) > (tableSectionLen >> 1))
             {
-                // same logic as test_saw
-                // 1) keep fractional bits only up to 'wavelength'
+                // Debug print for VS debug console (commented out)
+                // OutputDebugStringA("Looping wavetable - saw section reset\n");
+                // Reset position: 1) keep fractional bits only up to 'wavelength'
                 pos &= ((static_cast<rspl::Int64>(wavelength) << 32) - 1);
-                // 2) skip 16 periods
+                // 2) skip 16 periods (saw cycles)
                 pos += (static_cast<rspl::Int64>(wavelength) * 16) << 32;
                 resampler.set_playback_pos(pos);
             }
 
-            // Grab the block
+            // Grab the block into a temporary buffer.
             std::vector<float> temp(numSamples, 0.0f);
             resampler.interpolate_block(temp.data(), numSamples);
 
-            // Volume & output
+            // Apply volume & output.
             for (int i = 0; i < numSamples; ++i)
             {
                 float s = temp[i] * volume;
@@ -199,7 +230,7 @@ namespace project
             else if (P == 1) { currentPitchParameter = static_cast<float>(v); }
         }
 
-        // Example: 2 parameters -> volume & pitch
+        // Example: 2 parameters -> volume & pitch.
         void createParameters(ParameterDataList& data)
         {
             {
