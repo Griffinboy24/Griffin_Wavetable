@@ -7,34 +7,15 @@
 #pragma warning (4 : 4800) // "forcing value to bool 'true' or 'false'"
 #endif
 
-#include "src/resampler/def.h"
-#include "src/resampler/Downsampler2Flt.h"
-#include "src/resampler/fnc.h"
-#include "src/resampler/Fixed3232.h"
-#include "src/resampler/Int16.h"
-#include "src/resampler/Int64.h"
-#include "src/resampler/InterpFlt.h"
-#include "src/resampler/InterpPack.h"
-#include "src/resampler/MipMapFlt.h"
-#include "src/resampler/ResamplerFlt.h"
-#include "src/resampler/BaseVoiceState.h"
 
-// Implementation .cpp files (you can compile them separately if you prefer)
-#include "src/resampler/BaseVoiceState.cpp"
-#include "src/resampler/Downsampler2Flt.cpp"
-#include "src/resampler/InterpPack.cpp"
-#include "src/resampler/MipMapFlt.cpp"
-#include "src/resampler/ResamplerFlt.cpp"
+#include "src\griffinwave\rspl.h"
+#include "src\griffinwave\rspl_basevoicestate.h"
+#include "src\griffinwave\rspl_default_coefs.h"
+#include "src\griffinwave\rspl_downsampler2flt.h"
+#include "src\griffinwave\rspl_interp.h"
+#include "src\griffinwave\rspl_mipmap.h"
+#include "src\griffinwave\rspl_resamplerflt.h"
 
-#include "src/resampler/Downsampler2Flt.hpp"
-#include "src/resampler/InterpFlt.hpp"
-#include "src/resampler/InterpFltPhase.hpp"
-#include "src/resampler/MipMapFlt.hpp"
-
-#if defined (_MSC_VER)
-#include <crtdbg.h>
-#include <new.h>
-#endif
 
 #include <fstream>
 #include <iostream>
