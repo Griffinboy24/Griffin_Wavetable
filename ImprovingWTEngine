@@ -1,0 +1,273 @@
+#pragma once
+#include <JuceHeader.h>
+#include <cstring>
+
+#if defined (_MSC_VER)
+#pragma warning (4 : 4786) // "identifier was truncated"
+#pragma warning (4 : 4800) // "forcing value to bool 'true' or 'false'"
+#endif
+
+#include "src/griffinwave/rspl.h"
+#include "src/griffinwave/rspl_basevoicestate.h"
+#include "src/griffinwave/rspl_default_coefs.h"
+#include "src/griffinwave/rspl_downsampler2flt.h"
+#include "src/griffinwave/rspl_interp.h"
+#include "src/griffinwave/rspl_mipmap.h"
+#include "src/griffinwave/rspl_resamplerflt.h"
+
+#include <fstream>
+#include <iostream>
+#include <new>
+#include <stdexcept>
+#include <streambuf>
+#include <vector>
+#include <cassert>
+#include <climits>
+#include <cstdlib>
+#include <cmath> // required for sin()
+
+namespace project
+{
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    //===============================================================
+    // Real-time saw example with EXACT test_saw() wrap logic.
+    // The full wavetable contains 256 cycles.
+    // Only the first two cycles are saw (with headroom) and the remaining 254 cycles are sine.
+    // For playback, we want to loop only over the first saw cycle (i.e. 2048 samples).
+    // Extra padding of 2048 samples is added at each side via wrap-around.
+    //===============================================================
+    template <int NV>
+    struct Griffin_WT : public data::base
+    {
+        SNEX_NODE(Griffin_WT);
+
+        struct MetadataClass
+        {
+            SN_NODE_ID("Griffin_WT");
+        };
+
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int getFixChannelAmount() { return 2; }
+        static constexpr int NumTables = 0;
+        static constexpr int NumSliderPacks = 0;
+        static constexpr int NumAudioFiles = 0;
+        static constexpr int NumFilters = 0;
+        static constexpr int NumDisplayBuffers = 0;
+        //===============================================================
+        // Resampler fields
+        //===============================================================
+        // The sawSignal holds the full waveform table plus extra padding.
+        std::vector<float> sawSignal;
+        rspl::MipMapFlt    mipMap;
+        rspl::InterpPack   interpPack;
+        rspl::ResamplerFlt resampler;
+
+        // Single-cycle length for each waveform (2048 samples).
+        const long wavelength = 1L << 11; // 2048
+
+        // Total number of cycles in the waveform table.
+        const long totalCycles = 256;
+
+        // We want only two cycles to be a saw.
+        const long sawCycles = 2;
+        // The remainder will be sine.
+        const long sineCycles = totalCycles - sawCycles; // 254
+
+        // The saw section length in the table (in samples).
+        long sawSectionLen = sawCycles * wavelength; // 2 * 2048 = 4096
+
+        // Playback will be looped over a single cycle of saw.
+        const long loopCycles = 1;
+        const long loopRegionLength = loopCycles * wavelength; // 1 * 2048
+
+        // Total waveform table length (without padding).
+        long totalTableLen = totalCycles * wavelength;  // 256 * 2048
+
+        // Extra padding at each end.
+        const long extraPadding = 2048;
+
+        // User parameters.
+        float currentPitchParameter = 0.0f; // in octaves.
+        float volume = 1.0f;
+
+        Griffin_WT() {}
+
+        //===============================================================
+        // Prepare: Build a temporary waveform table then pad it.
+        // The first 'sawCycles' (2 cycles) are generated as a saw waveform (with 80% amplitude)
+        // and the remaining 'sineCycles' (254 cycles) are generated as sine.
+        // Extra wrap-around padding of 2048 samples is applied to both ends.
+        //===============================================================
+        void prepare(PrepareSpecs specs)
+        {
+            sawSectionLen = sawCycles * wavelength;
+            totalTableLen = totalCycles * wavelength;
+            const long paddedLength = extraPadding + totalTableLen + extraPadding;
+
+            // Temporary buffer (unpadded).
+            std::vector<float> waveform(totalTableLen);
+
+            // Generate the saw waveform for the first sawCycles.
+            const float headroom = 0.8f;
+            {
+                double saw_val, saw_step;
+                for (long cycle = 0; cycle < sawCycles; ++cycle)
+                {
+                    saw_val = -1.0;
+                    saw_step = 2.0 / (static_cast<double>(wavelength) - 1.0);
+                    for (long sample = 0; sample < wavelength; ++sample)
+                    {
+                        const long idx = cycle * wavelength + sample;
+                        waveform[idx] = static_cast<float>(headroom * saw_val);
+                        saw_val += saw_step;
+                    }
+                }
+            }
+
+            // Generate the sine waveform for the remaining sineCycles.
+            {
+                for (long cycle = 0; cycle < sineCycles; ++cycle)
+                {
+                    for (long sample = 0; sample < wavelength; ++sample)
+                    {
+                        const long idx = sawCycles * wavelength + cycle * wavelength + sample;
+                        const double phase = (2.0 * M_PI * sample) / wavelength;
+                        waveform[idx] = static_cast<float>(std::sin(phase));
+                    }
+                }
+            }
+
+            // Create the full buffer (with extra padding).
+            sawSignal.resize(paddedLength);
+
+            // Pre-padding: copy the last extraPadding samples from the waveform.
+            for (long i = 0; i < extraPadding; i++)
+            {
+                sawSignal[i] = waveform[totalTableLen - extraPadding + i];
+            }
+
+            // Main waveform.
+            for (long i = 0; i < totalTableLen; i++)
+            {
+                sawSignal[i + extraPadding] = waveform[i];
+            }
+
+            // Post-padding: copy the first extraPadding samples from the waveform.
+            for (long i = 0; i < extraPadding; i++)
+            {
+                sawSignal[i + extraPadding + totalTableLen] = waveform[i];
+            }
+
+            // Set up the mipMap from the padded buffer.
+            mipMap.init_sample(
+                paddedLength,
+                rspl::InterpPack::get_len_pre(),
+                rspl::InterpPack::get_len_post(),
+                12,
+                rspl::ResamplerFlt::_fir_mip_map_coef_arr,
+                rspl::ResamplerFlt::MIP_MAP_FIR_LEN
+            );
+            mipMap.fill_sample(sawSignal.data(), paddedLength);
+
+            // Connect resampler.
+            resampler.set_sample(mipMap);
+            resampler.set_interp(interpPack);
+            resampler.clear_buffers();
+        }
+
+        void reset()
+        {
+            resampler.clear_buffers();
+        }
+
+        //===============================================================
+        // Process: Loop playback strictly over the first saw cycle.
+        // The loop region in the padded buffer is from [extraPadding, extraPadding+2048).
+        // A bitmask is used on the fixed-point value (preserving the fractional part for smooth looping).
+        //===============================================================
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+            float* leftChannelData = audioBlock.getChannelPointer(0);
+            float* rightChannelData = audioBlock.getChannelPointer(1);
+            const int numSamples = data.getNumSamples();
+
+            // Convert pitch parameter.
+            const long fixedPitch = rspl::round_long(
+                currentPitchParameter * (1 << rspl::ResamplerFlt::NBR_BITS_PER_OCT)
+            );
+            resampler.set_pitch(fixedPitch);
+
+            // Constrain playback pointer to the loop region [extraPadding, extraPadding+loopRegionLength)
+            rspl::Int64 pos = resampler.get_playback_pos();
+            long integerPos = static_cast<long>(pos >> 32);
+            DBG("Before reset, integerPos = " + String(integerPos));
+
+            if (integerPos < extraPadding || integerPos >= (extraPadding + loopRegionLength))
+            {
+                // Wrap the fixed-point position within loopRegionLength.
+                rspl::Int64 wrappedPart = pos & ((static_cast<rspl::Int64>(loopRegionLength) << 32) - 1);
+                // Add the offset for pre-padding so that the new position is within the loop region.
+                rspl::Int64 newPos = (static_cast<rspl::Int64>(extraPadding) << 32) + wrappedPart;
+                DBG("Resetting playback pos. New integerPos = " + String(static_cast<long>(newPos >> 32)));
+                resampler.set_playback_pos(newPos);
+            }
+
+            // Interpolate audio block.
+            std::vector<float> temp(numSamples, 0.0f);
+            resampler.interpolate_block(temp.data(), numSamples);
+
+            // Apply volume and output to channels.
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float s = temp[i] * volume;
+                leftChannelData[i] = s;
+                rightChannelData[i] = s;
+            }
+        }
+
+        //===============================================================
+        // Parameter handling.
+        //===============================================================
+        template <int P>
+        void setParameter(double v)
+        {
+            if (P == 0) { volume = static_cast<float>(v); }
+            else if (P == 1) { currentPitchParameter = static_cast<float>(v); }
+        }
+
+        // Define parameters.
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data p("Volume", { 0.0, 1.0, 0.0001 });
+                p.setDefaultValue(0.35);
+                registerCallback<0>(p);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Pitch", { 0.0, 9.0, 0.0001 });
+                p.setDefaultValue(0.0);
+                registerCallback<1>(p);
+                data.add(std::move(p));
+            }
+        }
+
+        void handleHiseEvent(HiseEvent& e) {}
+        SN_EMPTY_PROCESS_FRAME;
+    };
+
+} // namespace project
