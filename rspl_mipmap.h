@@ -13,7 +13,6 @@
 #ifndef RSPL_MIPMAP_H
 #define RSPL_MIPMAP_H
 
-#include "rspl.h"      // Provides basic definitions: def.h, integer types, rspl_FORCEINLINE, min/max, etc.
 #include <vector>
 #include <cassert>
 

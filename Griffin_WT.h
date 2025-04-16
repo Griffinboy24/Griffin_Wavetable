@@ -7,15 +7,17 @@
 #pragma warning (4 : 4800) // "forcing value to bool 'true' or 'false'"
 #endif
 
-
-#include "src\griffinwave\rspl.h"
-#include "src\griffinwave\rspl_basevoicestate.h"
-#include "src\griffinwave\rspl_default_coefs.h"
-#include "src\griffinwave\rspl_downsampler2flt.h"
-#include "src\griffinwave\rspl_interp.h"
-#include "src\griffinwave\rspl_mipmap.h"
-#include "src\griffinwave\rspl_resamplerflt.h"
-
+/*===============================================================
+  External rspl headers (unchanged)
+===============================================================*/
+#include "src\\griffinwave2\\rspl_big_arrays.cpp"
+#include "src\\griffinwave2\\rspl_big_arrays.h"
+#include "src\\griffinwave2\\rspl.h"
+#include "src\\griffinwave2\\rspl_basevoicestate.h"
+#include "src\\griffinwave2\\rspl_downsampler2flt.h"
+#include "src\\griffinwave2\\rspl_interp.h"
+#include "src\\griffinwave2\\rspl_mipmap.h"
+#include "src\\griffinwave2\\rspl_resamplerflt.h"
 
 #include <fstream>
 #include <iostream>
@@ -26,7 +28,7 @@
 #include <cassert>
 #include <climits>
 #include <cstdlib>
-#include <cmath> // required for sin()
+#include <cmath> // for sin()
 
 namespace project
 {
@@ -39,11 +41,9 @@ namespace project
     using namespace hise;
     using namespace scriptnode;
 
-    //===============================================================
-    // Real-time saw example with EXACT test_saw() wrap logic, using two
-    // padded waveforms: a saw (first half) and then a sine (second half). 
-    // We only use the saw in playback.
-    //===============================================================
+    /*===============================================================
+      Griffin_WT
+    ===============================================================*/
     template <int NV>
     struct Griffin_WT : public data::base
     {
@@ -58,160 +58,130 @@ namespace project
         static constexpr bool isPolyphonic() { return NV > 1; }
         static constexpr bool hasTail() { return false; }
         static constexpr bool isSuspendedOnSilence() { return false; }
-        static constexpr int getFixChannelAmount() { return 2; }
-        static constexpr int NumTables = 0;
-        static constexpr int NumSliderPacks = 0;
-        static constexpr int NumAudioFiles = 0;
-        static constexpr int NumFilters = 0;
-        static constexpr int NumDisplayBuffers = 0;
-        //===============================================================
-        // Resampler fields
-        //===============================================================
-        std::vector<float> sawSignal;  // Now holds both waveforms consecutively.
+        static constexpr int  getFixChannelAmount() { return 2; }
+        static constexpr int  NumTables = 0;
+        static constexpr int  NumSliderPacks = 0;
+        static constexpr int  NumAudioFiles = 0;
+        static constexpr int  NumFilters = 0;
+        static constexpr int  NumDisplayBuffers = 0;
+
+        /*---------------------------------------------------------------
+          Resampler, mip?map and wavetable fields
+        ---------------------------------------------------------------*/
+        std::vector<float> wavetable;
         rspl::MipMapFlt    mipMap;
         rspl::InterpPack   interpPack;
         rspl::ResamplerFlt resampler;
 
-        // We replicate test_saw from the original main.cpp:
-        //   wavelength must be a power of two,
-        //   block_len = 256 (arbitrary),
-        //   we build two sections by copying a cycle repeatedly.
-        // Single-cycle length for each waveform is now 2048 samples.
-        const long wavelength = 1L << 11; // 2048
-        long tableSectionLen = 0;         // length of one waveform section (saw or sine)
+        /*---------------------------------------------------------------
+          Wavetable specification
+        ---------------------------------------------------------------*/
+        static constexpr long baseCycleLen = 1L << 11;      // 2048
+        static constexpr long halfCycle = baseCycleLen >> 1;
+        const long numSawCycles = 1;
+        const long numSineCycles = 255;
+        const long totalCycles = numSawCycles + numSineCycles;
+        const long paddedCycleLen = baseCycleLen + halfCycle; // 3072
+        long       totalTableLen = totalCycles * paddedCycleLen;
 
-        // Our user parameters
+        /*---------------------------------------------------------------
+          Parameters
+        ---------------------------------------------------------------*/
         float currentPitchParameter = 0.0f; // in octaves
         float volume = 1.0f;
 
+        /*---------------------------------------------------------------
+          Ctor / prepare / reset
+        ---------------------------------------------------------------*/
         Griffin_WT() {}
 
-        //===============================================================
-        // Prepare: replicate the test_saw approach but create two padded sections.
-        // First half is a saw (with headroom) and second half is sine.
-        //===============================================================
         void prepare(PrepareSpecs specs)
         {
-            const long blockLen = 256;  // number of cycles per waveform section
-            tableSectionLen = wavelength * blockLen; // length for one waveform type
-            const long totalTableLen = tableSectionLen * 2;  // two sections: saw then sine
+            totalTableLen = totalCycles * paddedCycleLen;
+            wavetable.resize(totalTableLen);
 
-            // Resize wavetable to hold both waveforms
-            sawSignal.resize(totalTableLen);
-
-            // Generate saw waveform (first half) with headroom (e.g. 80% of full amplitude)
-            const float headroom = 0.8f;
+            /* first cycle = saw */
             {
-                double saw_val;
-                const double saw_step = 2.0 / (static_cast<double>(wavelength) - 1.0);
-                // Repeat single-cycle saw wave for blockLen cycles.
-                for (long cycle = 0; cycle < blockLen; ++cycle)
+                const float headroom = 0.8f;
+                const double saw_step = 2.0 / (static_cast<double>(baseCycleLen) - 1.0);
+                double saw_val = -1.0;
+                for (long s = 0; s < baseCycleLen; ++s)
                 {
-                    saw_val = -1.0;
-                    for (long sample = 0; sample < wavelength; ++sample)
-                    {
-                        const long idx = cycle * wavelength + sample;
-                        sawSignal[idx] = static_cast<float>(headroom * saw_val);
-                        saw_val += saw_step;
-                    }
+                    wavetable[s] = static_cast<float>(headroom * saw_val);
+                    saw_val += saw_step;
                 }
+                /* pad first half */
+                for (long s = 0; s < halfCycle; ++s)
+                    wavetable[baseCycleLen + s] = wavetable[s];
             }
 
-            // Generate sine waveform (second half) padded identically.
+            /* remaining cycles = sine */
+            for (long c = 1; c < totalCycles; ++c)
             {
-                for (long cycle = 0; cycle < blockLen; ++cycle)
+                long offset = c * paddedCycleLen;
+                for (long s = 0; s < baseCycleLen; ++s)
                 {
-                    for (long sample = 0; sample < wavelength; ++sample)
-                    {
-                        const long idx = tableSectionLen + cycle * wavelength + sample;
-                        const double phase = (2.0 * M_PI * sample) / wavelength;
-                        sawSignal[idx] = static_cast<float>(std::sin(phase));
-                    }
+                    const double phase = (2.0 * M_PI * s) / baseCycleLen;
+                    wavetable[offset + s] = static_cast<float>(std::sin(phase));
                 }
+                for (long s = 0; s < halfCycle; ++s)
+                    wavetable[offset + baseCycleLen + s] = wavetable[offset + s];
             }
 
-            // MipMap: 12 levels -> up to 10 octaves.
-            // Note: totalTableLen is used now.
+            /* build mip?map */
             mipMap.init_sample(
                 totalTableLen,
                 rspl::InterpPack::get_len_pre(),
                 rspl::InterpPack::get_len_post(),
-                12, // same as test_saw
-                rspl::ResamplerFlt::_fir_mip_map_coef_arr,
-                rspl::ResamplerFlt::MIP_MAP_FIR_LEN
-            );
-            mipMap.fill_sample(sawSignal.data(), totalTableLen);
+                12,
+                rspl::MIP_MAP_FIR_COEF_ARR,
+                rspl::ResamplerFlt::MIP_MAP_FIR_LEN);
+            mipMap.fill_sample(wavetable.data(), totalTableLen);
 
-            // Hook up resampler.
             resampler.set_sample(mipMap);
             resampler.set_interp(interpPack);
             resampler.clear_buffers();
         }
 
-        void reset()
-        {
-            resampler.clear_buffers();
-        }
+        void reset() { resampler.clear_buffers(); }
 
-        //===============================================================
-        // Process: EXACT looping logic from test_saw.
-        // We force looping within the first section (saw) only.
-        // Debug prints via VS debug console are coded (commented out).
-        //===============================================================
+        /*---------------------------------------------------------------
+          process – uses per?voice masking, no manual wrapping
+        ---------------------------------------------------------------*/
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
         {
-            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
-            auto audioBlock = fixData.toAudioBlock();
-            float* leftChannelData = audioBlock.getChannelPointer(0);
-            float* rightChannelData = audioBlock.getChannelPointer(1);
-            const int numSamples = data.getNumSamples();
+            auto& fix = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto block = fix.toAudioBlock();
+            float* L = block.getChannelPointer(0);
+            float* R = block.getChannelPointer(1);
+            const int n = data.getNumSamples();
 
-            // Convert pitch: we are going from -2..+10, or whatever you do.
             const long fixedPitch = rspl::round_long(
-                currentPitchParameter * (1 << rspl::ResamplerFlt::NBR_BITS_PER_OCT)
-            );
+                currentPitchParameter * (1 << rspl::ResamplerFlt::NBR_BITS_PER_OCT));
             resampler.set_pitch(fixedPitch);
 
-            // EXACT test_saw loop-check:
-            // We use only the saw section (first half), so if pos > (tableSectionLen >> 1),
-            // do the bitmask and skip 16 periods.
-            rspl::Int64 pos = resampler.get_playback_pos();
-            if ((pos >> 32) > (tableSectionLen >> 1))
-            {
-                // Debug print for VS debug console (commented out)
-                // OutputDebugStringA("Looping wavetable - saw section reset\n");
-                // Reset position: 1) keep fractional bits only up to 'wavelength'
-                pos &= ((static_cast<rspl::Int64>(wavelength) << 32) - 1);
-                // 2) skip 16 periods (saw cycles)
-                pos += (static_cast<rspl::Int64>(wavelength) * 16) << 32;
-                resampler.set_playback_pos(pos);
-            }
+            std::vector<float> tmp(n, 0.0f);
+            resampler.interpolate_block(tmp.data(), n);
 
-            // Grab the block into a temporary buffer.
-            std::vector<float> temp(numSamples, 0.0f);
-            resampler.interpolate_block(temp.data(), numSamples);
-
-            // Apply volume & output.
-            for (int i = 0; i < numSamples; ++i)
+            for (int i = 0; i < n; ++i)
             {
-                float s = temp[i] * volume;
-                leftChannelData[i] = s;
-                rightChannelData[i] = s;
+                float s = tmp[i] * volume;
+                L[i] = s;
+                R[i] = s;
             }
         }
 
-        //===============================================================
-        // Parameter Handling
-        //===============================================================
+        /*---------------------------------------------------------------
+          Parameter handling
+        ---------------------------------------------------------------*/
         template <int P>
         void setParameter(double v)
         {
-            if (P == 0) { volume = static_cast<float>(v); }
-            else if (P == 1) { currentPitchParameter = static_cast<float>(v); }
+            if (P == 0)        volume = static_cast<float>(v);
+            else if (P == 1)   currentPitchParameter = static_cast<float>(v);
         }
 
-        // Example: 2 parameters -> volume & pitch.
         void createParameters(ParameterDataList& data)
         {
             {
