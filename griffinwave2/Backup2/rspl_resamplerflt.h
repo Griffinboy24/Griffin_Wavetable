@@ -1,246 +1,234 @@
-/******************************************************************************
-    rspl_resamplerflt.h – Header?only ResamplerFlt
-    MODIFIED 2025?04?16: per?voice single?cycle support
-******************************************************************************/
-
+/*====================================================================
+    rspl_resamplerflt.h – ResamplerFlt now drives a per?frame
+    rspl::MipMapSet<256, 3072>.
+====================================================================*/
 #ifndef RSPL_RESAMPLERFLT_H
 #define RSPL_RESAMPLERFLT_H
 
 #include <vector>
 #include <cstring>
 #include <cassert>
-#include <cmath>
 
-namespace rspl {
 
-    class InterpPack;
-    class MipMapFlt;
-
+namespace rspl
+{
     class ResamplerFlt
     {
     public:
         enum { MIP_MAP_FIR_LEN = 81 };
         enum { NBR_BITS_PER_OCT = BaseVoiceState::NBR_BITS_PER_OCT };
-        enum { BASE_CYCLE_LEN = 1 << 11 };   // 2048?sample saw cycle
+
+        enum { FRAME_LEN = 1 << 11 };          /* 2048 */
+        enum { FRAME_PAD = FRAME_LEN >> 1 };   /* 1024 (guard) */
+        enum { FRAME_STRIDE = FRAME_LEN + FRAME_PAD }; /* 3072 */
+        enum { FRAME_COUNT = 256 };
+
+        typedef MipMapSet<FRAME_COUNT, FRAME_STRIDE> SampleSet;
 
         ResamplerFlt();
         ~ResamplerFlt() {}
 
-        /* connections */
-        void set_interp(const InterpPack& interp);
-        void set_sample(const MipMapFlt& spl);
+        void set_interp(const InterpPack& ip);
+        void set_sample(const SampleSet& set);
         void remove_sample();
 
-        /* control */
-        void set_pitch(long pitch);
-        long get_pitch() const;
+        void set_pitch(long p);
+        long get_pitch() const { return _pitch; }
+
+        void set_frame(UInt32 f);
+        UInt32 get_frame() const { return _target_frame; }
+
         void set_playback_pos(Int64 pos);
         Int64 get_playback_pos() const;
 
-        /* render */
-        void interpolate_block(float dest_ptr[], long nbr_spl);
+        void interpolate_block(float* dst, long n);
         void clear_buffers();
 
     private:
-        enum VoiceInfo { VoiceInfo_CURRENT = 0, VoiceInfo_FADEOUT, VoiceInfo_NBR_ELT };
+        enum Voice { CUR = 0, FADE, NBR };
 
         std::vector<float> _buf;
-        const MipMapFlt* _mip_map_ptr;
-        const InterpPack* _interp_ptr;
-        Downsampler2Flt    _dwnspl;
-        BaseVoiceState     _voice_arr[VoiceInfo_NBR_ELT];
+        const SampleSet* _set;
+        const InterpPack* _ip;
+        Downsampler2Flt    _dwn;
+        BaseVoiceState     _v[NBR];
         long               _pitch;
+        UInt32             _target_frame;
         long               _buf_len;
         long               _fade_pos;
         bool               _fade_flag;
-        bool               _fade_needed_flag;
-        bool               _can_use_flag;
+        bool               _fade_needed;
 
         /* helpers */
-        void   reset_pitch_cur_voice();
-        void   fade_block(float dest_ptr[], long nbr_spl);
-        int    compute_table(long pitch);
-        void   begin_mip_map_fading();
+        void reset_cur_voice();
+        void begin_fade();
+        void fade_block(float* dst, long n);
+        static int table_from_pitch(long p);
 
-        /* no copies */
-        ResamplerFlt(const ResamplerFlt&);
-        ResamplerFlt& operator=(const ResamplerFlt&);
+        /* no copy */
+        ResamplerFlt(const ResamplerFlt&) = delete;
+        ResamplerFlt& operator=(const ResamplerFlt&) = delete;
     };
 
-    /*----------------------------- constructor -----------------------------*/
+    /*---------------- ctor ----------------*/
     inline ResamplerFlt::ResamplerFlt()
-        : _buf(), _mip_map_ptr(0), _interp_ptr(0), _dwnspl(), _voice_arr(),
-        _pitch(0), _buf_len(128), _fade_pos(0),
-        _fade_flag(false), _fade_needed_flag(false), _can_use_flag(false)
+        : _buf(),
+        _set(nullptr),
+        _ip(nullptr),
+        _dwn(),
+        _v(),
+        _pitch(0),
+        _target_frame(0),
+        _buf_len(128),
+        _fade_pos(0),
+        _fade_flag(false),
+        _fade_needed(false)
     {
-        _dwnspl.set_coefs(DOWNSAMPLER_COEF_ARR);
+        _dwn.set_coefs(DOWNSAMPLER_COEF_ARR);
         _buf.resize(_buf_len * 2);
     }
 
-    /*------------------------------ wiring --------------------------------*/
-    inline void ResamplerFlt::set_interp(const InterpPack& interp)
+    /*-------------- wiring --------------*/
+    inline void ResamplerFlt::set_interp(const InterpPack& ip) { _ip = &ip; }
+
+    inline void ResamplerFlt::set_sample(const SampleSet& set)
     {
-        _interp_ptr = &interp;
+        _set = &set;
+        _v[CUR]._pos._all = 0;
+        reset_cur_voice();
     }
 
-    inline void ResamplerFlt::set_sample(const MipMapFlt& spl)
+    inline void ResamplerFlt::remove_sample() { _set = nullptr; }
+
+    /*-------------- helpers -------------*/
+    inline int ResamplerFlt::table_from_pitch(long p)
     {
-        assert(spl.is_ready());
-        _mip_map_ptr = &spl;
-        _pitch = 0;
-        _voice_arr[VoiceInfo_CURRENT]._pos._all = 0;
-        reset_pitch_cur_voice();
+        return (p >= 0) ? (p >> NBR_BITS_PER_OCT) : 0;
     }
 
-    inline void ResamplerFlt::remove_sample() { _mip_map_ptr = 0; }
-
-    /*----------------------------- pitch ----------------------------------*/
-    inline void ResamplerFlt::set_pitch(long pitch)
+    inline void ResamplerFlt::reset_cur_voice()
     {
-        assert(_mip_map_ptr && _interp_ptr);
-        assert(pitch < _mip_map_ptr->get_nbr_tables() * (1L << NBR_BITS_PER_OCT));
+        BaseVoiceState& v = _v[CUR];
+        v._table = table_from_pitch(_pitch);
+        v._ovrspl_flag = (_pitch >= 0);
 
-        BaseVoiceState& old_v = _voice_arr[VoiceInfo_FADEOUT];
-        BaseVoiceState& cur_v = _voice_arr[VoiceInfo_CURRENT];
+        v._cycle_len = FRAME_LEN >> v._table;
+        v._cycle_mask = v._cycle_len - 1U;
 
-        _pitch = pitch;
-        const int new_table = compute_table(pitch);
-        const bool new_ovrspl = (pitch >= 0);
-        _fade_needed_flag = (new_table != cur_v._table) || (new_ovrspl != cur_v._ovrspl_flag);
+        v._frame_idx = _target_frame;
+        v._table_ptr = _set->use_table(v._table, v._frame_idx);
 
-        cur_v.compute_step(_pitch);
-        if (_fade_flag) { old_v.compute_step(_pitch); }
+        v.compute_step(_pitch);
     }
 
-    inline long ResamplerFlt::get_pitch() const { return _pitch; }
+    /*-------------- pitch ---------------*/
+    inline void ResamplerFlt::set_pitch(long p)
+    {
+        assert(_set && _ip);
+        assert(p < _set->get_nbr_tables() * (1L << NBR_BITS_PER_OCT));
 
-    /*--------------------------- playback pos -----------------------------*/
+        _pitch = p;
+        bool need = (table_from_pitch(p) != _v[CUR]._table) ||
+            ((_pitch >= 0) != _v[CUR]._ovrspl_flag);
+        if (need) _fade_needed = true;
+
+        _v[CUR].compute_step(_pitch);
+        if (_fade_flag) _v[FADE].compute_step(_pitch);
+    }
+
+    /*-------------- frame ---------------*/
+    inline void ResamplerFlt::set_frame(UInt32 f)
+    {
+        f &= (FRAME_COUNT - 1);
+        if (f == _target_frame) return;
+        _target_frame = f;
+        _fade_needed = true;
+    }
+
+    /*----------- playback pos -----------*/
     inline void ResamplerFlt::set_playback_pos(Int64 pos)
     {
-        assert(_mip_map_ptr && _interp_ptr);
-        assert(pos >= 0 && (pos >> 32) < _mip_map_ptr->get_sample_len());
-
-        _voice_arr[VoiceInfo_CURRENT]._pos._all = pos >> _voice_arr[VoiceInfo_CURRENT]._table;
-        if (_fade_flag)
-            _voice_arr[VoiceInfo_FADEOUT]._pos._all = pos >> _voice_arr[VoiceInfo_FADEOUT]._table;
+        _v[CUR]._pos._all = pos >> _v[CUR]._table;
+        if (_fade_flag) _v[FADE]._pos._all = pos >> _v[FADE]._table;
     }
 
     inline Int64 ResamplerFlt::get_playback_pos() const
     {
-        const BaseVoiceState& cur_v = _voice_arr[VoiceInfo_CURRENT];
-        return (cur_v._pos._all << cur_v._table);
+        return (_v[CUR]._pos._all << _v[CUR]._table);
     }
 
-    /*---------------------------- helpers ---------------------------------*/
-    inline int ResamplerFlt::compute_table(long pitch)
+    /*-------------- fade ---------------*/
+    inline void ResamplerFlt::begin_fade()
     {
-        return (pitch >= 0) ? (pitch >> NBR_BITS_PER_OCT) : 0;
-    }
+        _v[FADE] = _v[CUR];          /* copy old voice */
+        reset_cur_voice();           /* rebuild CUR with new state */
 
-    /* per?voice table / cycle / mask */
-    inline void ResamplerFlt::reset_pitch_cur_voice()
-    {
-        assert(_mip_map_ptr);
-        BaseVoiceState& cur = _voice_arr[VoiceInfo_CURRENT];
+        int d = _v[FADE]._table - _v[CUR]._table;
+        _v[CUR]._pos._all = shift_bidi(_v[FADE]._pos._all, d);
 
-        cur._table = compute_table(_pitch);
-        cur._table_len = _mip_map_ptr->get_lev_len(cur._table);
-        cur._table_ptr = _mip_map_ptr->use_table(cur._table);
-        cur._ovrspl_flag = (_pitch >= 0);
-
-        cur._cycle_len = static_cast<UInt32>(BASE_CYCLE_LEN >> cur._table);
-        cur._cycle_mask = cur._cycle_len - 1U;
-
-        cur.compute_step(_pitch);
-    }
-
-    inline void ResamplerFlt::begin_mip_map_fading()
-    {
-        BaseVoiceState& old_v = _voice_arr[VoiceInfo_FADEOUT];
-        BaseVoiceState& cur_v = _voice_arr[VoiceInfo_CURRENT];
-
-        old_v = cur_v;                // copy incl. cycle data
-        reset_pitch_cur_voice();      // recompute cur_v for new table
-        const int d = old_v._table - cur_v._table;
-        cur_v._pos._all = shift_bidi(old_v._pos._all, d);
-
-        _fade_needed_flag = false;
         _fade_flag = true;
         _fade_pos = 0;
+        _fade_needed = false;
     }
 
-    /*---------------------------- rendering --------------------------------*/
-    inline void ResamplerFlt::interpolate_block(float dest_ptr[], long nbr_spl)
-    {
-        assert(_mip_map_ptr && _interp_ptr && dest_ptr && nbr_spl > 0);
-
-        if (_fade_needed_flag && !_fade_flag) { begin_mip_map_fading(); }
-
-        long pos = 0;
-        while (pos < nbr_spl)
-        {
-            long work = nbr_spl - pos;
-            if (_fade_flag)
-            {
-                work = min(work, _buf_len);
-                work = min(work, BaseVoiceState::FADE_LEN - _fade_pos);
-                fade_block(dest_ptr + pos, work);
-            }
-            else if (_voice_arr[VoiceInfo_CURRENT]._ovrspl_flag)
-            {
-                work = min(work, _buf_len);
-                _interp_ptr->interp_ovrspl(&_buf[0], work * 2, _voice_arr[VoiceInfo_CURRENT]);
-                _dwnspl.downsample_block(dest_ptr + pos, &_buf[0], work);
-            }
-            else
-            {
-                _interp_ptr->interp_norm(dest_ptr + pos, work, _voice_arr[VoiceInfo_CURRENT]);
-                _dwnspl.phase_block(dest_ptr + pos, dest_ptr + pos, work);
-            }
-            pos += work;
-        }
-    }
-
-    inline void ResamplerFlt::fade_block(float dest_ptr[], long n)
+    inline void ResamplerFlt::fade_block(float* dst, long n)
     {
         const long n2 = n * 2;
-        const float vStep = 1.0f / (BaseVoiceState::FADE_LEN * 2);
-        const float v = _fade_pos * (vStep * 2);
-
-        BaseVoiceState& old_v = _voice_arr[VoiceInfo_FADEOUT];
-        BaseVoiceState& cur_v = _voice_arr[VoiceInfo_CURRENT];
+        const float step = 1.0f / (BaseVoiceState::FADE_LEN * 2);
+        const float vol = _fade_pos * step * 2;
 
         memset(_buf.data(), 0, sizeof(_buf[0]) * n2);
 
-        if (cur_v._ovrspl_flag && old_v._ovrspl_flag)
-        {
-            _interp_ptr->interp_ovrspl_ramp_add(_buf.data(), n2, cur_v, v, vStep);
-            _interp_ptr->interp_ovrspl_ramp_add(_buf.data(), n2, old_v, 1.0f - v, -vStep);
-        }
-        else if (!cur_v._ovrspl_flag && old_v._ovrspl_flag)
-        {
-            _interp_ptr->interp_norm_ramp_add(_buf.data(), n2, cur_v, v, vStep);
-            _interp_ptr->interp_ovrspl_ramp_add(_buf.data(), n2, old_v, 1.0f - v, -vStep);
-        }
-        else
-        {
-            _interp_ptr->interp_ovrspl_ramp_add(_buf.data(), n2, cur_v, v, vStep);
-            _interp_ptr->interp_norm_ramp_add(_buf.data(), n2, old_v, 1.0f - v, -vStep);
-        }
+        _ip->interp_ovrspl_ramp_add(_buf.data(), n2, _v[CUR], vol, step);
+        _ip->interp_ovrspl_ramp_add(_buf.data(), n2, _v[FADE], 1.0f - vol, -step);
 
-        _dwnspl.downsample_block(dest_ptr, _buf.data(), n);
+        _dwn.downsample_block(dst, _buf.data(), n);
 
         _fade_pos += n;
         _fade_flag = (_fade_pos < BaseVoiceState::FADE_LEN);
     }
 
-    inline void ResamplerFlt::clear_buffers()
+    /*------------- render --------------*/
+    inline void ResamplerFlt::interpolate_block(float* dst, long n)
     {
-        _dwnspl.clear_buffers();
-        if (_mip_map_ptr) { reset_pitch_cur_voice(); }
-        _fade_needed_flag = false;
-        _fade_flag = false;
+        assert(_set && _ip && dst && n > 0);
+
+        if (_fade_needed && !_fade_flag) begin_fade();
+
+        long pos = 0;
+        while (pos < n)
+        {
+            long work = n - pos;
+
+            if (_fade_flag)
+            {
+                work = min(work, _buf_len);
+                work = min(work, BaseVoiceState::FADE_LEN - _fade_pos);
+                fade_block(dst + pos, work);
+            }
+            else if (_v[CUR]._ovrspl_flag)
+            {
+                work = min(work, _buf_len);
+                _ip->interp_ovrspl(_buf.data(), work * 2, _v[CUR]);
+                _dwn.downsample_block(dst + pos, _buf.data(), work);
+            }
+            else
+            {
+                _ip->interp_norm(dst + pos, work, _v[CUR]);
+                _dwn.phase_block(dst + pos, dst + pos, work);
+            }
+            pos += work;
+        }
     }
 
-} // namespace rspl
-#endif // RSPL_RESAMPLERFLT_H
+    /*------------ clear ----------------*/
+    inline void ResamplerFlt::clear_buffers()
+    {
+        _dwn.clear_buffers();
+        if (_set) reset_cur_voice();
+        _fade_flag = _fade_needed = false;
+    }
+
+} /* namespace rspl */
+
+#endif /* RSPL_RESAMPLERFLT_H */

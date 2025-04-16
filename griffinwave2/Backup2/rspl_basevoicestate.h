@@ -1,7 +1,4 @@
-/******************************************************************************
-    rspl_basevoicestate.h – Header?only BaseVoiceState
-    MODIFIED 2025?04?16: adds per?voice cycle_len / cycle_mask for single?cycle
-******************************************************************************/
+
 
 #ifndef RSPL_BASEVOICESTATE_H
 #define RSPL_BASEVOICESTATE_H
@@ -24,29 +21,30 @@ namespace rspl
 
         void compute_step(long pitch);
 
-        /* public data ----------------------------------------------------- */
         Fixed3232     _pos;          // 32.32 position
-        Fixed3232     _step;         // 32.32 step
-        const float* _table_ptr;    // pointer to cycle start
-        long          _table_len;    // length of full MIP level
-        int           _table;        // current table index
-        bool          _ovrspl_flag;  // true if oversample path used
+        Fixed3232     _step;         // 32.32 step per sample
+        const float* _table_ptr;    // pointer to frame start in current MIP level
+        long          _table_len;    // total level length (unused for mask now)
+        int           _table;        // current MIP table
+        bool          _ovrspl_flag;  // true if oversampled path
 
-        /* NEW: single?cycle parameters */
-        UInt32        _cycle_len;    // power?of?two cycle length
-        UInt32        _cycle_mask;   // _cycle_len?1, for wrapping
+        UInt32        _cycle_len;    // power?of?two cycle length (2048  table)
+        UInt32        _cycle_mask;   // _cycle_len - 1
+
+        UInt32        _frame_idx;    // 0..255
+        UInt32        _frame_offset; // samples from start of level 0 to frame start
 
     private:
-        BaseVoiceState(const BaseVoiceState& other);            // forbidden
-        bool operator==(const BaseVoiceState& other);           // forbidden
-        bool operator!=(const BaseVoiceState& other);           // forbidden
+        BaseVoiceState(const BaseVoiceState&);
+        bool operator==(const BaseVoiceState&);
+        bool operator!=(const BaseVoiceState&);
     };
 
-    /*----------------------------- impl -----------------------------------*/
+    /*-------------------------------------------------------------------------*/
 
     inline BaseVoiceState::BaseVoiceState()
         : _pos(), _step(), _table_ptr(0), _table_len(0), _table(0), _ovrspl_flag(true),
-        _cycle_len(0), _cycle_mask(0)
+        _cycle_len(0), _cycle_mask(0), _frame_idx(0), _frame_offset(0)
     {
         _pos._all = 0;
         _step._all = static_cast<Int64>(0x80000000UL);
@@ -54,7 +52,6 @@ namespace rspl
 
     inline BaseVoiceState& BaseVoiceState::operator=(const BaseVoiceState& other)
     {
-        assert(&other != 0);
         _pos = other._pos;
         _step = other._step;
         _table_ptr = other._table_ptr;
@@ -63,27 +60,22 @@ namespace rspl
         _ovrspl_flag = other._ovrspl_flag;
         _cycle_len = other._cycle_len;
         _cycle_mask = other._cycle_mask;
+        _frame_idx = other._frame_idx;
+        _frame_offset = other._frame_offset;
         return *this;
     }
 
     inline void BaseVoiceState::compute_step(long pitch)
     {
-        int shift;
-        if (pitch < 0)
-        {
-            shift = -1 - ((~pitch) >> NBR_BITS_PER_OCT);
-        }
-        else
-        {
-            shift = (pitch >> NBR_BITS_PER_OCT) - _table;
-        }
-        if (!_ovrspl_flag) { ++shift; }
+        int shift = (pitch < 0)
+            ? -1 - ((~pitch) >> NBR_BITS_PER_OCT)
+            : (pitch >> NBR_BITS_PER_OCT) - _table;
+        if (!_ovrspl_flag) ++shift;
 
         const int mask = (1 << NBR_BITS_PER_OCT) - 1;
-        const int pitch_frac = static_cast<int>(pitch) & mask;
+        const int frac = pitch & mask;
         _step._all = static_cast<Int64>(floor(
-            exp(pitch_frac * (LN2 / static_cast<double>(1 << NBR_BITS_PER_OCT))) * (1UL << 31)));
-        assert(_step._all >= static_cast<Int64>(1UL << 31));
+            exp(frac * (LN2 / double(1 << NBR_BITS_PER_OCT))) * (1UL << 31)));
         _step._all = shift_bidi(_step._all, shift);
     }
 
